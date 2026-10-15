@@ -1,0 +1,42 @@
+[package]
+name = "transfermon"
+version = "0.1.0"
+edition = "2021"
+description = "Transfermon - trasferimento di file, impostazioni e programmi fra due PC Windows sulla stessa rete"
+publish = false
+
+[lib]
+name = "transfermon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "transfermon"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.36"
+egui = "0.36"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1.3"
+rand = "0.8"
+spake2 = "0.4"
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+socket2 = { version = "0.6", features = ["all"] }
+if-addrs = "0.15"
+walkdir = "2"
+filetime = "0.2"
+anyhow = "1"
+dirs = "6"
+rfd = "0.16"
+ab_glyph = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
