@@ -54,6 +54,8 @@ pub enum JobStatus {
     CollectingApps,
     Connecting(String),
     Pairing,
+    /// Scambio dell'elenco dei file o confronto con il disco: testo per l'utente.
+    Preparing(String),
     WaitingAccept,
     Incoming(IncomingSummary),
     Transferring,

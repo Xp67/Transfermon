@@ -744,6 +744,7 @@ impl App {
                 ),
                 JobStatus::Connecting(a) => theme::wait_line(ui, &format!("Collegamento a {a}"), false),
                 JobStatus::Pairing => theme::wait_line(ui, "Verifica del codice", false),
+                JobStatus::Preparing(t) => theme::wait_line(ui, t, false),
                 JobStatus::WaitingAccept => theme::wait_line(
                     ui,
                     "In attesa che il PC nuovo accetti il trasferimento",
@@ -809,6 +810,7 @@ impl App {
             JobStatus::Pairing => {
                 theme::wait_line(ui, "Un PC si sta collegando: verifica del codice", false);
             }
+            JobStatus::Preparing(t) => theme::wait_line(ui, t, false),
             JobStatus::Incoming(s) => self.incoming_ui(ui, s, &mut action),
             JobStatus::Transferring => {
                 progress_ui(ui, &self.theme, &self.shared.progress());

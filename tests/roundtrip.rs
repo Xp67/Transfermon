@@ -130,6 +130,47 @@ fn roundtrip_copies_tree_and_skips_identical_files_on_rerun() {
     let _ = fs::remove_dir_all(&base);
 }
 
+/// Elenchi più lunghi di un blocco (`MANIFEST_BATCH`): l'elenco viaggia a
+/// pezzi e il bitset dei file da saltare copre tutti gli indici.
+#[test]
+fn many_files_cross_manifest_batches_and_skip_on_rerun() {
+    let base = tmp("many");
+    let src = base.join("src");
+    let dst = base.join("dst");
+    const N: usize = 2 * transfermon::protocol::MANIFEST_BATCH + 321;
+    for i in 0..N {
+        let dir = src.join(format!("d{}", i % 7));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("f{i}.txt")), format!("{i}")).unwrap();
+    }
+    let kf = KnownFolders::under(&base);
+    let cancel = AtomicBool::new(false);
+    let s = scan::scan(Root::Absolute, &src, &kf, &cancel);
+    assert_eq!(s.files.len(), N);
+    let plan = Plan {
+        scans: vec![Arc::new(s)],
+        apps: None,
+    };
+    let (sent, received) = run_pair(plan, "654321", "654321", &dst);
+    assert_eq!(sent.expect("invio").files_ok as usize, N);
+    let received = received.expect("ricezione");
+    assert_eq!(received.files_ok as usize, N);
+    assert!(received.failed.is_empty(), "{:?}", &received.failed[..received.failed.len().min(5)]);
+    let d = dest_of_absolute(&dst, &src);
+    // l'ultimo file è f4320 e 4320 % 7 == 1
+    assert_eq!(fs::read(d.join("d1").join("f4320.txt")).unwrap(), b"4320");
+
+    let s2 = scan::scan(Root::Absolute, &src, &kf, &cancel);
+    let plan2 = Plan {
+        scans: vec![Arc::new(s2)],
+        apps: None,
+    };
+    let (sent2, received2) = run_pair(plan2, "654321", "654321", &dst);
+    assert_eq!(sent2.expect("invio 2").files_ok, 0);
+    assert_eq!(received2.expect("ricezione 2").files_ok, 0);
+    let _ = fs::remove_dir_all(&base);
+}
+
 #[test]
 fn wrong_pin_is_rejected_on_both_sides() {
     let base = tmp("pin");

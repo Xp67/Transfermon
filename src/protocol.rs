@@ -9,9 +9,11 @@
 use serde::{Deserialize, Serialize};
 
 /// Versione del protocollo: deve coincidere sui due PC.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 /// Dimensione massima di un frame cifrato accettato in lettura.
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
+/// Voci dell'elenco per pacchetto (2000 percorsi anche lunghi stanno in ~1 MB).
+pub const MANIFEST_BATCH: usize = 2000;
 /// Dimensione dei blocchi in cui vengono spezzati i file.
 pub const CHUNK_SIZE: usize = 1024 * 1024;
 /// Firma dei beacon UDP.
@@ -139,7 +141,12 @@ pub struct AppsBundle {
     pub winget_notes: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+/// Elenco completo di ciò che viene trasferito. Non viaggia mai in un unico
+/// pacchetto: con centinaia di migliaia di file supererebbe `MAX_FRAME`.
+/// Il mittente manda `ManifestStart`, poi `ManifestDirs`/`ManifestFiles` a
+/// blocchi di `MANIFEST_BATCH` voci, poi `ManifestEnd`; il destinatario lo
+/// ricompone.
+#[derive(Clone, Debug, Default)]
 pub struct Manifest {
     pub roots: Vec<Root>,
     pub dirs: Vec<DirEntry>,
@@ -148,12 +155,26 @@ pub struct Manifest {
     pub apps: Option<AppsBundle>,
 }
 
+/// Intestazione dell'elenco: i totali dichiarati e l'elenco programmi.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ManifestHead {
+    pub roots: Vec<Root>,
+    pub dirs: u64,
+    pub files: u64,
+    pub total_bytes: u64,
+    pub apps: Option<AppsBundle>,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Msg {
     Hello { name: String, user: String, version: u16 },
-    Manifest(Manifest),
-    /// Il PC nuovo accetta; `skip` sono gli indici dei file già presenti e identici.
-    Accept { skip: Vec<u32> },
+    ManifestStart(ManifestHead),
+    ManifestDirs(Vec<DirEntry>),
+    ManifestFiles(Vec<FileEntry>),
+    ManifestEnd,
+    /// Il PC nuovo accetta; `skip` è un bitset (un bit per file, nell'ordine
+    /// dell'elenco, bit meno significativo per primo) dei file già identici.
+    Accept { skip: Vec<u8> },
     Reject,
     FileData { index: u32, offset: u64, data: Vec<u8> },
     FileDone { index: u32 },
@@ -168,7 +189,10 @@ impl Msg {
     pub fn kind(&self) -> &'static str {
         match self {
             Msg::Hello { .. } => "Hello",
-            Msg::Manifest(_) => "Manifest",
+            Msg::ManifestStart(_) => "ManifestStart",
+            Msg::ManifestDirs(_) => "ManifestDirs",
+            Msg::ManifestFiles(_) => "ManifestFiles",
+            Msg::ManifestEnd => "ManifestEnd",
             Msg::Accept { .. } => "Accept",
             Msg::Reject => "Reject",
             Msg::FileData { .. } => "FileData",
@@ -179,6 +203,25 @@ impl Msg {
             Msg::Error(_) => "Error",
         }
     }
+}
+
+/// Bitset di `n` bit, tutti a zero.
+pub fn bitset_new(n: usize) -> Vec<u8> {
+    vec![0u8; n.div_ceil(8)]
+}
+
+pub fn bitset_set(bits: &mut [u8], i: usize) {
+    if let Some(b) = bits.get_mut(i / 8) {
+        *b |= 1 << (i % 8);
+    }
+}
+
+pub fn bitset_get(bits: &[u8], i: usize) -> bool {
+    bits.get(i / 8).map(|b| b & (1 << (i % 8)) != 0).unwrap_or(false)
+}
+
+pub fn bitset_count(bits: &[u8]) -> usize {
+    bits.iter().map(|b| b.count_ones() as usize).sum()
 }
 
 /// Ruolo annunciato nei beacon di rete.

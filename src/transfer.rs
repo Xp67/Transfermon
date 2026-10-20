@@ -1,7 +1,6 @@
 //! Motore di trasferimento: lato PC vecchio (`run_sender`) e lato PC nuovo
 //! (`run_receiver`). Vedi `protocol` per la sequenza dei messaggi.
 
-use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -14,11 +13,17 @@ use anyhow::{bail, Context, Result};
 use filetime::FileTime;
 
 use crate::dest::DestMap;
-use crate::protocol::{AppsBundle, FileEntry, Manifest, Msg, CHUNK_SIZE, PROTOCOL_VERSION};
+use crate::protocol::{
+    bitset_count, bitset_get, bitset_new, bitset_set, AppsBundle, FileEntry, Manifest,
+    ManifestHead, Msg, CHUNK_SIZE, MANIFEST_BATCH, PROTOCOL_VERSION,
+};
 use crate::scan::ScanResult;
 use crate::secure;
 use crate::shared::{IncomingSummary, JobStatus, Outcome, Shared};
 use crate::util;
+
+/// Limite di sicurezza sulle voci dichiarate dall'altro PC (memoria).
+const MAX_ENTRIES: u64 = 50_000_000;
 
 /// Cosa inviare: le scansioni selezionate e, opzionalmente, l'elenco programmi.
 pub struct Plan {
@@ -79,30 +84,46 @@ fn sender_inner(addr: SocketAddr, pin: &str, plan: &Plan, shared: &Shared) -> Re
     match ss.recv()? {
         Msg::Hello { name, version, .. } => {
             if version != PROTOCOL_VERSION {
-                bail!("l'altro PC usa una versione diversa di Transfermon (protocollo {version}, qui {PROTOCOL_VERSION})");
+                bail!("l'altro PC usa una versione diversa di Transfermon (protocollo {version}, qui {PROTOCOL_VERSION}): aggiorna entrambi i PC all'ultima versione");
             }
             shared.log(format!("Collegato al PC nuovo \"{name}\""));
         }
         other => bail!("risposta inattesa dal PC nuovo: {}", other.kind()),
     }
 
-    let (manifest, paths) = plan.manifest();
+    let (mut manifest, paths) = plan.manifest();
     shared.log(format!(
         "Invio dell'elenco: {} file, {} cartelle, {}",
         manifest.files.len(),
         manifest.dirs.len(),
         util::fmt_bytes(manifest.total_bytes)
     ));
-    let msg = Msg::Manifest(manifest);
-    ss.send(&msg)?;
+    shared.set_status(JobStatus::Preparing(format!(
+        "Invio dell'elenco dei file al PC nuovo ({} file)",
+        manifest.files.len()
+    )));
+    ss.send(&Msg::ManifestStart(ManifestHead {
+        roots: manifest.roots.clone(),
+        dirs: manifest.dirs.len() as u64,
+        files: manifest.files.len() as u64,
+        total_bytes: manifest.total_bytes,
+        apps: manifest.apps.take(),
+    }))?;
+    for chunk in manifest.dirs.chunks(MANIFEST_BATCH) {
+        ss.send(&Msg::ManifestDirs(chunk.to_vec()))?;
+    }
+    for chunk in manifest.files.chunks(MANIFEST_BATCH) {
+        ss.send(&Msg::ManifestFiles(chunk.to_vec()))?;
+        if shared.cancel.load(Ordering::Relaxed) {
+            bail!("trasferimento annullato");
+        }
+    }
+    ss.send(&Msg::ManifestEnd)?;
     ss.flush()?;
-    let Msg::Manifest(manifest) = msg else {
-        unreachable!()
-    };
 
     shared.set_status(JobStatus::WaitingAccept);
-    let skip: HashSet<u32> = match ss.recv()? {
-        Msg::Accept { skip } => skip.into_iter().collect(),
+    let skip: Vec<u8> = match ss.recv()? {
+        Msg::Accept { skip } => skip,
         Msg::Reject => bail!("il PC nuovo ha rifiutato il trasferimento"),
         Msg::Error(e) => bail!("errore sul PC nuovo: {e}"),
         other => bail!("risposta inattesa dal PC nuovo: {}", other.kind()),
@@ -111,15 +132,15 @@ fn sender_inner(addr: SocketAddr, pin: &str, plan: &Plan, shared: &Shared) -> Re
     let mut total_bytes = 0u64;
     let mut total_files = 0u64;
     for (i, f) in manifest.files.iter().enumerate() {
-        if !skip.contains(&(i as u32)) {
+        if !bitset_get(&skip, i) {
             total_bytes += f.size;
             total_files += 1;
         }
     }
-    if !skip.is_empty() {
+    let skipped = bitset_count(&skip);
+    if skipped > 0 {
         shared.log(format!(
-            "{} file sono già identici sul PC nuovo e non verranno ritrasmessi",
-            skip.len()
+            "{skipped} file sono già identici sul PC nuovo e non verranno ritrasmessi"
         ));
     }
     shared.start_progress(total_files, total_bytes);
@@ -130,7 +151,7 @@ fn sender_inner(addr: SocketAddr, pin: &str, plan: &Plan, shared: &Shared) -> Re
     let mut files_ok = 0u64;
     for (i, entry) in manifest.files.iter().enumerate() {
         let index = i as u32;
-        if skip.contains(&index) {
+        if bitset_get(&skip, i) {
             continue;
         }
         if shared.cancel.load(Ordering::Relaxed) {
@@ -242,6 +263,45 @@ fn same_file_present(dest: &DestMap, f: &FileEntry) -> bool {
     }
 }
 
+/// Riceve l'elenco a blocchi dopo `ManifestStart` e lo ricompone.
+fn receive_manifest(ss: &mut secure::SecureStream, head: ManifestHead, shared: &Shared) -> Result<Manifest> {
+    if head.files > MAX_ENTRIES || head.dirs > MAX_ENTRIES {
+        bail!("elenco troppo grande ({} file, {} cartelle)", head.files, head.dirs);
+    }
+    let mut manifest = Manifest {
+        roots: head.roots,
+        dirs: Vec::with_capacity(head.dirs.min(1_000_000) as usize),
+        files: Vec::with_capacity(head.files.min(1_000_000) as usize),
+        total_bytes: head.total_bytes,
+        apps: head.apps,
+    };
+    let mut last_status = Instant::now();
+    loop {
+        if shared.cancel.load(Ordering::Relaxed) {
+            bail!("trasferimento annullato");
+        }
+        match ss.recv()? {
+            Msg::ManifestDirs(d) => manifest.dirs.extend(d),
+            Msg::ManifestFiles(f) => manifest.files.extend(f),
+            Msg::ManifestEnd => break,
+            Msg::Error(e) => bail!("il PC vecchio ha interrotto: {e}"),
+            other => bail!("messaggio inatteso dal PC vecchio: {}", other.kind()),
+        }
+        if manifest.files.len() as u64 > head.files || manifest.dirs.len() as u64 > head.dirs {
+            bail!("elenco più lungo del dichiarato");
+        }
+        if last_status.elapsed() > Duration::from_millis(300) {
+            shared.set_status(JobStatus::Preparing(format!(
+                "Ricezione dell'elenco dei file ({} di {})",
+                manifest.files.len(),
+                head.files
+            )));
+            last_status = Instant::now();
+        }
+    }
+    Ok(manifest)
+}
+
 /// Lato PC nuovo: pairing, ricezione manifest, decisione dell'utente, scrittura.
 pub fn run_receiver(
     stream: TcpStream,
@@ -280,7 +340,7 @@ fn receiver_inner(
                     "versione di protocollo diversa ({version} contro {PROTOCOL_VERSION})"
                 )));
                 let _ = ss.flush();
-                bail!("il PC vecchio usa una versione diversa di Transfermon (protocollo {version}, qui {PROTOCOL_VERSION})");
+                bail!("il PC vecchio usa una versione diversa di Transfermon (protocollo {version}, qui {PROTOCOL_VERSION}): aggiorna entrambi i PC all'ultima versione");
             }
             (name, user)
         }
@@ -294,16 +354,32 @@ fn receiver_inner(
     ss.flush()?;
     shared.log(format!("Collegato al PC vecchio \"{peer_name}\" (utente {peer_user})"));
 
-    let manifest = match ss.recv()? {
-        Msg::Manifest(m) => m,
+    let head = match ss.recv()? {
+        Msg::ManifestStart(h) => h,
         other => bail!("messaggio inatteso dal PC vecchio: {}", other.kind()),
     };
+    shared.set_status(JobStatus::Preparing(format!(
+        "Ricezione dell'elenco dei file (0 di {})",
+        head.files
+    )));
+    let manifest = receive_manifest(&mut ss, head, shared)?;
+    shared.log(format!(
+        "Elenco ricevuto: {} file, {} cartelle, {}",
+        manifest.files.len(),
+        manifest.dirs.len(),
+        util::fmt_bytes(manifest.total_bytes)
+    ));
 
-    let mut skip: Vec<u32> = Vec::new();
+    shared.set_status(JobStatus::Preparing(
+        "Confronto con i file già presenti su questo PC".into(),
+    ));
+    let mut skip = bitset_new(manifest.files.len());
+    let mut skip_files = 0u64;
     let mut skip_bytes = 0u64;
     for (i, f) in manifest.files.iter().enumerate() {
         if same_file_present(dest, f) {
-            skip.push(i as u32);
+            bitset_set(&mut skip, i);
+            skip_files += 1;
             skip_bytes += f.size;
         }
     }
@@ -313,7 +389,7 @@ fn receiver_inner(
         files: manifest.files.len() as u64,
         dirs: manifest.dirs.len() as u64,
         bytes: manifest.total_bytes,
-        skip_files: skip.len() as u64,
+        skip_files,
         skip_bytes,
         apps: manifest.apps.as_ref().map(|a| a.installed.len()).unwrap_or(0),
         winget: manifest
@@ -332,8 +408,7 @@ fn receiver_inner(
         let _ = ss.flush();
         bail!("trasferimento rifiutato");
     }
-    let skipset: HashSet<u32> = skip.iter().copied().collect();
-    ss.send(&Msg::Accept { skip })?;
+    ss.send(&Msg::Accept { skip: skip.clone() })?;
     ss.flush()?;
 
     let mut failed: Vec<(String, String)> = Vec::new();
@@ -347,7 +422,7 @@ fn receiver_inner(
             Err(e) => failed.push((d.rel.clone(), e)),
         }
     }
-    let files_total = manifest.files.len() as u64 - skipset.len() as u64;
+    let files_total = manifest.files.len() as u64 - skip_files;
     shared.start_progress(files_total, manifest.total_bytes.saturating_sub(skip_bytes));
     shared.set_status(JobStatus::Transferring);
 
@@ -431,16 +506,11 @@ fn receiver_inner(
                 }
                 let path = match open.take() {
                     Some(o) if o.index == index => {
-                        let OpenFile { file, path, .. } = o;
-                        if let Err(e) = file.sync_data() {
-                            failed.push((entry.rel.clone(), format!("scrittura: {e}")));
-                            drop(file);
-                            let _ = fs::remove_file(&path);
-                            shared.file_done();
-                            continue;
-                        }
-                        drop(file);
-                        path
+                        // Niente sync per file: con centinaia di migliaia di file
+                        // piccoli costerebbe decine di minuti; il sistema operativo
+                        // scrive su disco per conto suo.
+                        drop(o.file);
+                        o.path
                     }
                     other => {
                         if let Some(o) = other {
